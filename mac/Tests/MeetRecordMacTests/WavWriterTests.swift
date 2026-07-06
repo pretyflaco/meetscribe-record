@@ -100,4 +100,43 @@ final class WavWriterTests: XCTestCase {
         XCTAssertEqual(l, 100, "Left channel must hold the mic sample")
         XCTAssertEqual(r, 200, "Right channel must hold the system-audio sample")
     }
+
+    /// Crash resilience: after writing more than the periodic patch
+    /// interval (10 s of audio) WITHOUT calling close(), the on-disk
+    /// header must already hold (near-)correct sizes — so a SIGKILLed
+    /// recorder leaves a usable chunk, not a zero-length `data` chunk.
+    func testHeaderPatchedPeriodicallyWithoutClose() throws {
+        let url = tmpURL("periodic.wav")
+        let writer = try WavWriter(url: url, sampleRate: 16_000, channels: 2)
+
+        // 11 s of stereo 16 kHz s16 = 704,000 data bytes > the 640,000-
+        // byte patch interval, so at least one in-place patch must fire.
+        let frames = 16_000 * 11
+        let interleaved = [Int16](repeating: 42, count: frames * 2)
+        try interleaved.withUnsafeBufferPointer { ptr in
+            try writer.writeSamples(ptr.baseAddress!, count: interleaved.count)
+        }
+        // Deliberately NO close() — simulate SIGKILL by just dropping to
+        // direct file inspection while the handle is still open.
+
+        let data = try Data(contentsOf: url)
+        XCTAssertEqual(data.count, 44 + 704_000)
+
+        let dataSize = data.subdata(in: 40..<44).withUnsafeBytes { $0.load(as: UInt32.self) }
+        let patched = Int(UInt32(littleEndian: dataSize))
+        // The patch fires on interval boundaries, so the recorded size
+        // lags the true size by at most one interval — but must never
+        // still be the placeholder 0.
+        XCTAssertGreaterThanOrEqual(patched, 640_000, "data size must have been patched in place")
+        XCTAssertLessThanOrEqual(patched, 704_000)
+
+        let riffSize = data.subdata(in: 4..<8).withUnsafeBytes { $0.load(as: UInt32.self) }
+        XCTAssertEqual(Int(UInt32(littleEndian: riffSize)), patched + 36)
+
+        try writer.close()
+        // After close, sizes must be exact.
+        let closed = try Data(contentsOf: url)
+        let finalSize = closed.subdata(in: 40..<44).withUnsafeBytes { $0.load(as: UInt32.self) }
+        XCTAssertEqual(Int(UInt32(littleEndian: finalSize)), 704_000)
+    }
 }

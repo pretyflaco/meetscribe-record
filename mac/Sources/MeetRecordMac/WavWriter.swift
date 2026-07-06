@@ -32,6 +32,16 @@ final class WavWriter {
     private var dataBytesWritten: UInt32 = 0
     private var closed = false
 
+    /// Re-patch the header sizes in place every ~10 s of audio so a
+    /// SIGKILL / hard crash (where `close()` and `deinit` never run)
+    /// leaves an at-most-10-s-stale header instead of a zero-length
+    /// `data` chunk. ffmpeg's concat demuxer trusts the header; the
+    /// Python side additionally repairs headers from file size before
+    /// stitching (capture.py:_repair_wav_header), so this is belt and
+    /// braces. 640,000 bytes = 10 s at 16 kHz stereo s16.
+    private let headerPatchIntervalBytes: Int = 640_000
+    private var bytesSinceHeaderPatch: Int = 0
+
     init(url: URL, sampleRate: UInt32, channels: UInt16) throws {
         self.url = url
         self.sampleRate = sampleRate
@@ -61,6 +71,7 @@ final class WavWriter {
             throw WavWriterError.writeFailed("\(error)")
         }
         dataBytesWritten += UInt32(byteCount)
+        maybePatchHeader(bytesJustWritten: byteCount)
     }
 
     /// Convenience: append a chunk of interleaved s16 samples from a Data buffer.
@@ -74,6 +85,7 @@ final class WavWriter {
             throw WavWriterError.writeFailed("\(error)")
         }
         dataBytesWritten += UInt32(data.count)
+        maybePatchHeader(bytesJustWritten: data.count)
     }
 
     /// Patch the RIFF + data chunk sizes and close the file.
@@ -95,6 +107,25 @@ final class WavWriter {
     }
 
     // MARK: - Private
+
+    /// Periodically rewrite the header sizes in place (crash resilience).
+    /// Best-effort: an I/O error here is swallowed — the next interval or
+    /// `close()` will retry, and the Python side repairs headers from the
+    /// file size before stitching anyway.
+    private func maybePatchHeader(bytesJustWritten: Int) {
+        bytesSinceHeaderPatch += bytesJustWritten
+        guard bytesSinceHeaderPatch >= headerPatchIntervalBytes else { return }
+        bytesSinceHeaderPatch = 0
+        guard let handle = handle, !closed else { return }
+        do {
+            let end = try handle.offset()
+            try handle.seek(toOffset: 0)
+            try writeHeader(dataLength: dataBytesWritten)
+            try handle.seek(toOffset: end)
+        } catch {
+            // Swallow: periodic patching must never break the recording.
+        }
+    }
 
     private func writeHeader(dataLength: UInt32) throws {
         guard let handle = handle else { return }
