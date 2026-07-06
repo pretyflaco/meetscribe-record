@@ -314,12 +314,27 @@ def record(output_dir, filename, mic, monitor, virtual_sink):
 
     session.start()
 
+    # The recorder subprocess is start_new_session=True-detached, so it
+    # never sees the terminal's signals itself — if this parent dies
+    # without calling session.stop(), the recorder keeps recording until
+    # the disk fills (ffmpeg does not exit on stdin EOF).  Two guards:
+    #   1. SIGTERM (systemd stop, kill, session logout) is translated
+    #      into the same KeyboardInterrupt path as Ctrl+C, giving a
+    #      graceful drain + stop.
+    #   2. A finally-block stops the session on ANY other exit path
+    #      (unexpected exception from the status loop, etc.).
+    def _sigterm_to_interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    prev_sigterm = signal.signal(signal.SIGTERM, _sigterm_to_interrupt)
+    stopped = False
     try:
         _recording_loop(session)
     except KeyboardInterrupt:
         _drain_countdown(session)
         click.echo("Stopping recording...")
         output = session.stop()
+        stopped = True
         if output.exists():
             size_mb = output.stat().st_size / (1024 * 1024)
             click.echo(f"Saved: {output} ({size_mb:.1f} MB)")
@@ -332,6 +347,16 @@ def record(output_dir, filename, mic, monitor, virtual_sink):
         else:
             click.echo("Warning: output file was not created", err=True)
         sys.exit(0)
+    finally:
+        signal.signal(signal.SIGTERM, prev_sigterm)
+        if not stopped:
+            # Reached on an unexpected exception (or SystemExit raised
+            # before stop completed): make sure no detached recorder
+            # outlives us.
+            try:
+                session.stop()
+            except Exception:
+                pass
 
 
 # ─── devices ─────────────────────────────────────────────────────────────────
