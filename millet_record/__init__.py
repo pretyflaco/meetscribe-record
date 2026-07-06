@@ -17,7 +17,7 @@ Version is the single source of truth here; pyproject.toml's
 [project] section pulls it dynamically via setuptools.dynamic.
 """
 
-__version__ = "0.4.4"
+__version__ = "0.5.0"
 
 # ── Backward-compat: meet_record alias ──────────────────────────────────────
 # Existing code (e.g. older meetscribe-offline 0.8.3 compatibility shims,

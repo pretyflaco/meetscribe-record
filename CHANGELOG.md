@@ -5,6 +5,50 @@ Notable changes per release of `millet-record` (formerly
 [`millet-pipeline`](https://github.com/pretyflaco/millet).
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## v0.5.0 — 2026-07-06 — orphan-recorder race fixes, leak-proof lifecycle, crash-safe WAV headers
+
+Reliability release.  Fixes the stop/pause-vs-watchdog races that could
+leave a detached recorder process recording forever, plus a set of
+resource-leak and crash-resilience fixes found in the 2026-07 ecosystem
+review.  Test suite grows 53 → 69 (16 new race/lifecycle tests).
+
+### Fixed
+
+* **`stop()`/`pause()` vs watchdog races (orphaned recorder).**  Session
+  state was mutated outside `_lock` while the watchdog thread read it
+  under the lock.  Because recorders run `start_new_session=True`-
+  detached, a watchdog restart racing a `stop()` or `pause()` could
+  spawn a fresh recorder *after* the old one was killed — a process
+  that records until the disk fills, with nobody left to stop it.
+  `stop()` now joins the watchdog **before** killing the recorder (and
+  closes the shared log last); `pause()` holds `_lock` across the
+  stop + flag pair; `_attempt_restart` re-checks stop/pause/failed
+  state under the lock and abandons a lost race.
+* **`record` CLI leaked the recorder on any non-Ctrl+C exit.**  Only
+  `KeyboardInterrupt` triggered `session.stop()`.  Unexpected
+  exceptions and SIGTERM (systemd stop, `kill`, session logout) exited
+  the parent while the detached recorder kept running.  Now: a
+  `finally` guard stops the session on every exit path, and SIGTERM is
+  translated into the same graceful drain + stop as Ctrl+C.
+* **`start()` failure leaked audio plumbing.**  A startup failure left
+  the log handle open, the PulseAudio null-sink/loopback modules loaded
+  (breaking the user's audio routing until a manual
+  `pactl unload-module`), and an empty chunk file on disk.  All torn
+  down on failure now.
+* **`stop()` could hang forever on a wedged concat.**  The chunk-stitch
+  `ffmpeg` call had no timeout.  Now budgeted proportionally to total
+  chunk size (floor 120 s) with the existing largest-chunk fallback.
+* **SIGKILLed chunks silently truncated.**  A recorder killed with
+  SIGKILL (or lost to a host crash) never patched its WAV header, so
+  the chunk carried a 0-length `data` size while holding real audio —
+  and `ffmpeg -f concat -c copy` trusts the header.  Two-layer fix:
+  the macOS sidecar's `WavWriter` now re-patches header sizes in place
+  every ~10 s of audio, and the Python side repairs every chunk's
+  header from the on-disk file size before stitching
+  (`_repair_wav_header`).
+* **`status()`/`pause()` froze up to 10 s during a watchdog restart.**
+  The blocking recorder-startup poll no longer runs under `_lock`.
+
 ## v0.4.4 — 2026-06-16 — cap requires-python at <3.14 (coincurve build fail)
 
 Packaging guard.  No code change.
