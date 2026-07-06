@@ -173,6 +173,71 @@ def _extract_last_stop_reason(log_path: Path) -> str:
     return matches[-1]
 
 
+# ─── WAV header repair ───────────────────────────────────────────────────────
+
+
+def _repair_wav_header(path: Path) -> bool:
+    """Patch RIFF/data chunk sizes to match the actual file size.
+
+    A recorder killed with SIGKILL (or lost to a host crash) never runs
+    its close() path, so the WAV header keeps placeholder sizes (0, or
+    a stale periodic snapshot) while the file holds real audio bytes.
+    ``ffmpeg -f concat -c copy`` trusts the header, so an unrepaired
+    chunk would silently truncate the stitched output.
+
+    Walks the RIFF chunk list to find the ``data`` chunk (robust to
+    extra chunks like ``LIST``), then rewrites the data size and the
+    top-level RIFF size from the on-disk file length.  Sizes are
+    clamped to the 32-bit WAV format limit.
+
+    Returns True if the header was modified, False if the file was
+    already consistent or isn't a parseable WAV.  Raises OSError on
+    I/O failure (caller decides how loud to be).
+    """
+    size = path.stat().st_size
+    if size <= _WAV_HEADER_BYTES:
+        return False
+
+    _U32_MAX = 0xFFFFFFFF
+    with open(path, "r+b") as f:
+        head = f.read(12)
+        if len(head) < 12 or head[0:4] != b"RIFF" or head[8:12] != b"WAVE":
+            return False
+        stored_riff = int.from_bytes(head[4:8], "little")
+
+        # Walk chunks to find 'data'
+        offset = 12
+        data_offset: int | None = None
+        stored_data = 0
+        while offset + 8 <= size:
+            f.seek(offset)
+            chunk_hdr = f.read(8)
+            if len(chunk_hdr) < 8:
+                break
+            if chunk_hdr[0:4] == b"data":
+                data_offset = offset
+                stored_data = int.from_bytes(chunk_hdr[4:8], "little")
+                break
+            csize = int.from_bytes(chunk_hdr[4:8], "little")
+            offset += 8 + csize + (csize & 1)  # chunks are word-aligned
+        if data_offset is None:
+            return False
+
+        actual_data = min(size - (data_offset + 8), _U32_MAX)
+        actual_riff = min(size - 8, _U32_MAX)
+
+        changed = False
+        if stored_data != actual_data:
+            f.seek(data_offset + 4)
+            f.write(actual_data.to_bytes(4, "little"))
+            changed = True
+        if stored_riff != actual_riff:
+            f.seek(4)
+            f.write(actual_riff.to_bytes(4, "little"))
+            changed = True
+    return changed
+
+
 # ─── Data classes ────────────────────────────────────────────────────────────
 
 
@@ -277,8 +342,16 @@ class RecordingSession:
         self._chunks = []
 
         # Start first chunk — this polls until ffmpeg is actually
-        # writing audio data before we continue.
-        self._start_ffmpeg_chunk()
+        # writing audio data before we continue.  On failure, tear down
+        # everything we set up: a raised RuntimeError here previously
+        # left the log handle open, the PulseAudio null-sink/loopback
+        # modules loaded (breaking the user's audio routing until a
+        # manual `pactl unload-module`), and an empty chunk on disk.
+        try:
+            self._start_ffmpeg_chunk()
+        except BaseException:
+            self._cleanup_failed_start()
+            raise
 
         # Record when we started (for metadata); elapsed time is derived
         # from file size, not from this timestamp.
@@ -293,6 +366,41 @@ class RecordingSession:
         )
         self._watchdog_thread.start()
 
+    def _cleanup_failed_start(self) -> None:
+        """Best-effort teardown after a failed ``start()``.
+
+        Kills any half-started recorder, closes the log handle, unloads
+        PulseAudio virtual-sink modules, and removes header-only chunk
+        files.  Never raises — the original startup exception is the
+        one the caller should see.
+        """
+        try:
+            self._stop_ffmpeg()
+        except Exception:
+            pass
+
+        if self._ffmpeg_log:
+            try:
+                self._ffmpeg_log.close()
+            except OSError:
+                pass
+            self._ffmpeg_log = None
+
+        if self.use_virtual_sink:
+            try:
+                self._teardown_virtual_sink()
+            except Exception:
+                pass
+
+        # Remove chunks that never got real audio (header-only or less);
+        # anything larger is kept — never destroy captured audio.
+        for chunk in self._chunks:
+            try:
+                if chunk.exists() and chunk.stat().st_size <= _WAV_HEADER_BYTES:
+                    chunk.unlink()
+            except OSError:
+                pass
+
     def stop(self) -> Path:
         """Stop recording, stitch chunks, and return the output file path.
 
@@ -301,31 +409,50 @@ class RecordingSession:
         Returns:
             Path to the final output WAV file.
         """
-        # Signal watchdog to stop
+        # Signal watchdog to stop, then JOIN IT FIRST.  Order matters:
+        # if we killed the recorder before the watchdog exited, a
+        # watchdog thread already inside `_attempt_restart` could spawn
+        # a fresh recorder *after* our kill — and because recorders run
+        # `start_new_session=True`-detached, that orphan would record
+        # forever with nobody left to stop it (race observed in the
+        # 0.5.0 review).  Joining first guarantees no restart can be
+        # in flight when we stop the process below.  The join budget
+        # covers a worst-case in-flight restart (startup poll timeout
+        # plus stop-ladder escalation).
         self._stop_event.set()
-
-        # Stop current ffmpeg process (no-op if already paused/stopped)
-        if not self._paused:
-            self._stop_ffmpeg()
-        self._paused = False
-
-        # Close ffmpeg log
-        if self._ffmpeg_log:
-            try:
-                self._ffmpeg_log.close()
-            except OSError:
-                pass
-            self._ffmpeg_log = None
-
-        # Wait for watchdog to exit
         if self._watchdog_thread and self._watchdog_thread.is_alive():
-            self._watchdog_thread.join(timeout=5)
+            self._watchdog_thread.join(timeout=_STARTUP_TIMEOUT + 20)
+
+        with self._lock:
+            # Stop current recorder process (no-op if already paused/stopped)
+            if not self._paused:
+                self._stop_ffmpeg()
+            self._paused = False
+
+            # Close recorder log — only after the watchdog is gone, so a
+            # racing restart can never write to (or reopen) a closed handle.
+            if self._ffmpeg_log:
+                try:
+                    self._ffmpeg_log.close()
+                except OSError:
+                    pass
+                self._ffmpeg_log = None
 
         if self.use_virtual_sink:
             self._teardown_virtual_sink()
 
         # Stitch chunks into final output
         valid_chunks = [c for c in self._chunks if c.exists() and c.stat().st_size > 0]
+
+        # Repair WAV headers before stitching/renaming.  A recorder that
+        # died via SIGKILL (or a hard host crash) never patched its
+        # RIFF/data sizes; ffmpeg's `-f concat -c copy` trusts the header
+        # and would silently truncate such a chunk to zero samples.
+        for chunk in valid_chunks:
+            try:
+                _repair_wav_header(chunk)
+            except OSError:
+                pass
 
         if len(valid_chunks) == 0:
             # No audio captured at all
@@ -385,15 +512,20 @@ class RecordingSession:
         Raises:
             RuntimeError: If not currently recording or already paused.
         """
+        # Stop + flag-set must be atomic w.r.t. the watchdog: if the
+        # chunk process exited but `_paused` wasn't yet set, the
+        # watchdog would see a dead, unpaused recorder and restart it —
+        # and a later stop() (which skips `_stop_ffmpeg` for paused
+        # sessions) would leak that restarted process forever.
         with self._lock:
             if self._paused:
                 raise RuntimeError("Recording is already paused")
             if self._failed:
                 raise RuntimeError("Recording has failed; cannot pause")
 
-        # Stop the current ffmpeg process (finalizes the chunk WAV)
-        self._stop_ffmpeg()
-        self._paused = True
+            # Stop the current recorder process (finalizes the chunk WAV)
+            self._stop_ffmpeg()
+            self._paused = True
 
     def resume(self) -> None:
         """Resume recording after a pause by starting a new chunk.
@@ -404,10 +536,15 @@ class RecordingSession:
         with self._lock:
             if not self._paused:
                 raise RuntimeError("Recording is not paused")
+            self._paused = False
+            proc, chunk_path, log_path = self._spawn_recorder_chunk()
 
-        self._paused = False
-        self._start_ffmpeg_chunk()
-        self._last_growth_time = time.monotonic()
+        # Blocking startup poll happens outside the lock so status()
+        # stays responsive while the new chunk warms up.
+        self._wait_for_recorder_data(proc, chunk_path, log_path)
+        with self._lock:
+            self._last_file_size = 0
+            self._last_growth_time = time.monotonic()
 
     def status(self) -> RecordingStatus:
         """Get current recording status (thread-safe).
@@ -542,21 +679,40 @@ class RecordingSession:
         ]
 
     def _start_ffmpeg_chunk(self) -> None:
-        """Start the recorder writing to a new chunk file.
+        """Start the recorder writing to a new chunk file and wait for data.
 
-        Despite the legacy name, this dispatches between the Linux ffmpeg
-        path and the macOS sidecar path based on
-        ``_darwin_backend_enabled()``. The ``Popen`` setup, startup poll,
-        log-file handling, and downstream watchdog are identical across
-        backends because the sidecar speaks ffmpeg's stop protocol.
+        Convenience wrapper for the non-contended call sites
+        (``start()``); spawns the recorder, then blocks until it
+        produces audio data (or the startup budget expires).  The
+        watchdog restart path uses the split
+        ``_spawn_recorder_chunk`` / ``_wait_for_recorder_data``
+        primitives directly so the blocking poll happens outside
+        ``_lock``.
+        """
+        with self._lock:
+            proc, chunk_path, log_path = self._spawn_recorder_chunk()
+        self._wait_for_recorder_data(proc, chunk_path, log_path)
+        with self._lock:
+            self._last_file_size = 0
+            self._last_growth_time = time.monotonic()
+
+    def _spawn_recorder_chunk(self) -> tuple[subprocess.Popen, Path, Path]:
+        """Spawn the recorder for a new chunk file (state mutation only).
+
+        Despite the legacy naming around "ffmpeg", this dispatches
+        between the Linux ffmpeg path and the macOS sidecar path based
+        on ``_darwin_backend_enabled()``. The ``Popen`` setup, log-file
+        handling, and downstream watchdog are identical across backends
+        because the sidecar speaks ffmpeg's stop protocol.
+
+        Caller must hold ``_lock`` (mutates ``_chunks``,
+        ``_current_chunk``, ``_ffmpeg_log``, ``_ffmpeg_proc``).  Returns
+        ``(proc, chunk_path, log_path)`` for a subsequent
+        ``_wait_for_recorder_data`` call made *outside* the lock.
         """
         chunk_idx = len(self._chunks)
         stem = self.output_file.stem
-        if chunk_idx == 0:
-            # First chunk — use output name directly (will rename/concat on stop)
-            chunk_path = self.output_dir / f"{stem}.chunk-{chunk_idx:03d}.wav"
-        else:
-            chunk_path = self.output_dir / f"{stem}.chunk-{chunk_idx:03d}.wav"
+        chunk_path = self.output_dir / f"{stem}.chunk-{chunk_idx:03d}.wav"
 
         self._current_chunk = chunk_path
         self._chunks.append(chunk_path)
@@ -606,39 +762,51 @@ class RecordingSession:
             stderr=self._ffmpeg_log,
             start_new_session=True,
         )
+        return self._ffmpeg_proc, chunk_path, log_path
 
-        # Wait for ffmpeg to start producing audio data.
-        # Instead of a fixed sleep, poll the output file until it has
-        # actual audio data (size > WAV header ~44 bytes).  This way
-        # our elapsed timer starts from when recording truly begins.
+    def _wait_for_recorder_data(
+        self, proc: subprocess.Popen, chunk_path: Path, log_path: Path
+    ) -> None:
+        """Block until the recorder produces audio data (or budget expires).
+
+        Instead of a fixed sleep, poll the output file until it has
+        actual audio data (size > WAV header ~44 bytes).  This way our
+        elapsed timer starts from when recording truly begins.
+
+        Must be called *without* holding ``_lock``: the poll can take up
+        to ``_STARTUP_TIMEOUT`` seconds and must not freeze ``status()``
+        / ``pause()`` callers.  Reads only the ``proc`` handle it was
+        given, so a concurrent stop/restart can't confuse it.  Bails out
+        early when ``_stop_event`` is set (session is being stopped).
+
+        Raises RuntimeError if the recorder exited during startup.
+        """
         deadline = time.monotonic() + _STARTUP_TIMEOUT
         while time.monotonic() < deadline:
-            # Check if ffmpeg died during startup
-            if self._ffmpeg_proc.poll() is not None:
+            if self._stop_event.is_set():
+                return
+            # Check if the recorder died during startup
+            if proc.poll() is not None:
                 raise RuntimeError(
-                    f"ffmpeg failed to start (exit code {self._ffmpeg_proc.returncode}). "
+                    f"ffmpeg failed to start (exit code {proc.returncode}). "
                     f"Check log: {log_path}"
                 )
             # Check if output file has audio data (WAV header is ~44 bytes)
             try:
                 if chunk_path.exists() and chunk_path.stat().st_size > 1024:
-                    break
+                    return
             except OSError:
                 pass
             time.sleep(_STARTUP_POLL_INTERVAL)
-        else:
-            # Timed out — check if ffmpeg is still alive at least
-            if self._ffmpeg_proc.poll() is not None:
-                raise RuntimeError(
-                    f"ffmpeg failed to start (exit code {self._ffmpeg_proc.returncode}). "
-                    f"Check log: {log_path}"
-                )
-            # ffmpeg is alive but no data yet — continue anyway,
-            # the watchdog will handle stalls
 
-        # Reset growth tracking for new chunk
-        self._last_file_size = 0
-        self._last_growth_time = time.monotonic()
+        # Timed out — check if the recorder is still alive at least
+        if proc.poll() is not None:
+            raise RuntimeError(
+                f"ffmpeg failed to start (exit code {proc.returncode}). "
+                f"Check log: {log_path}"
+            )
+        # Recorder is alive but no data yet — continue anyway,
+        # the watchdog will handle stalls
 
     def _stop_ffmpeg(self) -> None:
         """Gracefully stop the current ffmpeg process.
@@ -694,46 +862,77 @@ class RecordingSession:
         self._ffmpeg_proc = None
 
     def _attempt_restart(self, reason: str) -> bool:
-        """Try to restart ffmpeg to a new chunk. Returns True if successful."""
-        if self._restart_count >= _MAX_RESTART_ATTEMPTS:
-            self._failed = True
-            self._fail_reason = f"Max restart attempts ({_MAX_RESTART_ATTEMPTS}) exceeded. Last: {reason}"
-            return False
+        """Try to restart the recorder into a new chunk. Returns True if OK.
 
-        # Stop current (possibly dead) process
-        self._stop_ffmpeg()
+        Called from the watchdog thread *without* ``_lock`` held.  All
+        shared-state mutation happens under the lock; only the blocking
+        startup poll runs unlocked (so ``status()``/``pause()`` don't
+        freeze for up to ``_STARTUP_TIMEOUT`` seconds during a restart).
+        Re-checks the session state after acquiring the lock: a
+        concurrent ``stop()``/``pause()`` won the race and the restart
+        must be abandoned (returning True — the session state is valid,
+        just no longer ours to restart).
+        """
+        with self._lock:
+            if self._stop_event.is_set() or self._paused or self._failed:
+                return True
 
-        self._restart_count += 1
+            if self._restart_count >= _MAX_RESTART_ATTEMPTS:
+                self._failed = True
+                self._fail_reason = f"Max restart attempts ({_MAX_RESTART_ATTEMPTS}) exceeded. Last: {reason}"
+                return False
 
-        if self._ffmpeg_log and not self._ffmpeg_log.closed:
-            self._ffmpeg_log.write(
-                f"\n--- RESTART #{self._restart_count} at {datetime.now().isoformat()} "
-                f"reason: {reason} ---\n"
-            )
-            self._ffmpeg_log.flush()
+            # Stop current (possibly dead) process
+            self._stop_ffmpeg()
+
+            self._restart_count += 1
+
+            if self._ffmpeg_log and not self._ffmpeg_log.closed:
+                self._ffmpeg_log.write(
+                    f"\n--- RESTART #{self._restart_count} at {datetime.now().isoformat()} "
+                    f"reason: {reason} ---\n"
+                )
+                self._ffmpeg_log.flush()
+
+            try:
+                proc, chunk_path, log_path = self._spawn_recorder_chunk()
+            except Exception as e:
+                self._failed = True
+                self._fail_reason = f"Restart failed: {e}"
+                return False
 
         try:
-            self._start_ffmpeg_chunk()
-            return True
-        except Exception as e:
-            self._failed = True
-            self._fail_reason = f"Restart failed: {e}"
+            self._wait_for_recorder_data(proc, chunk_path, log_path)
+        except RuntimeError as e:
+            with self._lock:
+                self._failed = True
+                self._fail_reason = f"Restart failed: {e}"
             return False
+
+        with self._lock:
+            self._last_file_size = 0
+            self._last_growth_time = time.monotonic()
+        return True
 
     # ── Watchdog ─────────────────────────────────────────────────────────
 
     def _watchdog_loop(self) -> None:
-        """Background thread that monitors ffmpeg health."""
+        """Background thread that monitors recorder health.
+
+        Health checks run under ``_lock``; the (potentially slow)
+        restart itself runs outside it — see ``_attempt_restart``.
+        """
         while not self._stop_event.is_set():
             self._stop_event.wait(timeout=_WATCHDOG_INTERVAL)
             if self._stop_event.is_set():
                 break
 
+            restart_reason: str | None = None
             with self._lock:
                 if self._failed:
                     break
 
-                # Skip health checks while paused (no ffmpeg process running)
+                # Skip health checks while paused (no recorder running)
                 if self._paused:
                     continue
 
@@ -741,29 +940,31 @@ class RecordingSession:
                 if proc is None:
                     continue
 
-                # Check 1: Is ffmpeg still running?
+                # Check 1: Is the recorder still running?
                 exit_code = proc.poll()
                 if exit_code is not None:
-                    reason = f"ffmpeg exited with code {exit_code}"
-                    self._attempt_restart(reason)
-                    continue
+                    restart_reason = f"ffmpeg exited with code {exit_code}"
+                else:
+                    # Check 2: Is the file still growing?
+                    chunk = self._current_chunk
+                    if chunk and chunk.exists():
+                        try:
+                            current_size = chunk.stat().st_size
+                        except OSError:
+                            continue
 
-                # Check 2: Is the file still growing?
-                chunk = self._current_chunk
-                if chunk and chunk.exists():
-                    try:
-                        current_size = chunk.stat().st_size
-                    except OSError:
-                        continue
+                        if current_size > self._last_file_size:
+                            self._last_file_size = current_size
+                            self._last_growth_time = time.monotonic()
+                        else:
+                            stall_duration = time.monotonic() - self._last_growth_time
+                            if stall_duration > _STALL_TIMEOUT:
+                                restart_reason = (
+                                    f"Output file stalled for {stall_duration:.0f}s"
+                                )
 
-                    if current_size > self._last_file_size:
-                        self._last_file_size = current_size
-                        self._last_growth_time = time.monotonic()
-                    else:
-                        stall_duration = time.monotonic() - self._last_growth_time
-                        if stall_duration > _STALL_TIMEOUT:
-                            reason = f"Output file stalled for {stall_duration:.0f}s"
-                            self._attempt_restart(reason)
+            if restart_reason is not None:
+                self._attempt_restart(restart_reason)
 
     # ── Chunk stitching ──────────────────────────────────────────────────
 
@@ -796,8 +997,22 @@ class RecordingSession:
                 "copy",
                 str(self.output_file),
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
+            # Stream-copy concat is I/O bound; budget generously (assume
+            # >= 20 MB/s) but never hang stop() forever on a wedged
+            # ffmpeg — subprocess.run kills the child on timeout.
+            try:
+                total_bytes = sum(c.stat().st_size for c in chunks)
+            except OSError:
+                total_bytes = 0
+            timeout = max(120.0, total_bytes / (20 * 1024 * 1024))
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=timeout
+                )
+                concat_failed = result.returncode != 0
+            except subprocess.TimeoutExpired:
+                concat_failed = True
+            if concat_failed:
                 # Fallback: just use the largest chunk
                 largest = max(chunks, key=lambda c: c.stat().st_size)
                 largest.rename(self.output_file)
