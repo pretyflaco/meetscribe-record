@@ -97,6 +97,94 @@ def read_stereo_channels(audio_path: Path) -> StereoChannels | None:
     )
 
 
+# ─── Live per-channel activity metering ─────────────────────────────────────
+
+# ~-50 dBFS for 16-bit PCM — the silence floor below which samples are treated
+# as inactive.  Matches the pipeline's _is_single_source_stereo threshold so
+# record-side detection and transcribe-side single-source fallback agree on
+# what "silent" means.
+_SILENCE_THRESHOLD = 50.0
+
+
+def sample_channel_rms(
+    audio_path: Path,
+    *,
+    tail_seconds: float = 8.0,
+) -> tuple[float, float] | None:
+    """Measure recent per-channel active RMS from the tail of a stereo file.
+
+    Reads only the last ``tail_seconds`` of ``audio_path`` (via ffmpeg's
+    ``-sseof`` end-relative seek) so it stays cheap on a large, still-growing
+    recording chunk and reflects the *current* state of each channel rather
+    than the whole file.
+
+    Returns ``(mic_rms, system_rms)`` computed over active samples only
+    (those above the silence floor), or ``None`` if the file is mono, cannot
+    be decoded, or has no audio yet.  Callers should treat ``None`` as
+    "unknown" (never as "silent").
+    """
+    audio_path = Path(audio_path)
+
+    # Probe channel count / sample rate first.
+    probe_cmd = [
+        "ffprobe", "-v", "quiet",
+        "-show_entries", "stream=channels,sample_rate",
+        "-of", "json",
+        str(audio_path),
+    ]
+    try:
+        probe = subprocess.run(probe_cmd, capture_output=True, text=True)
+        if probe.returncode != 0:
+            return None
+        info = json.loads(probe.stdout)
+        stream = info.get("streams", [{}])[0]
+        n_channels = int(stream.get("channels", 0))
+        sample_rate = int(stream.get("sample_rate", 0))
+    except Exception:
+        return None
+
+    if n_channels != 2 or sample_rate == 0:
+        return None
+
+    # Decode only the tail to raw s16le PCM.  -sseof is placed before -i so
+    # ffmpeg seeks from end-of-file; on a short/just-started file it simply
+    # returns everything available.
+    decode_cmd = [
+        "ffmpeg", "-v", "quiet",
+        "-sseof", f"-{tail_seconds:g}",
+        "-i", str(audio_path),
+        "-f", "s16le",
+        "-acodec", "pcm_s16le",
+        "-ar", str(sample_rate),
+        "-ac", "2",
+        "-",
+    ]
+    try:
+        result = subprocess.run(decode_cmd, capture_output=True)
+        if result.returncode != 0 or not result.stdout:
+            return None
+        raw = result.stdout
+    except Exception:
+        return None
+
+    samples = np.frombuffer(raw, dtype=np.int16)
+    if len(samples) < 2:
+        return None
+    if len(samples) % 2 != 0:
+        samples = samples[:-1]
+    stereo = samples.reshape(-1, 2).astype(np.float32)
+    mic = stereo[:, 0]
+    system = stereo[:, 1]
+
+    def _active_rms(ch: np.ndarray) -> float:
+        active = ch[np.abs(ch) > _SILENCE_THRESHOLD]
+        if active.size == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(active**2)))
+
+    return _active_rms(mic), _active_rms(system)
+
+
 # ─── Audio compression ─────────────────────────────────────────────────────
 
 def _get_audio_duration(path: Path) -> float | None:

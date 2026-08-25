@@ -5,6 +5,37 @@ Notable changes per release of `millet-record` (formerly
 [`millet-pipeline`](https://github.com/pretyflaco/millet).
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## v0.5.1 — 2026-08-26 — system-channel silence detection
+
+Adds live detection of a silent system (remote) channel during recording.
+The system-audio monitor is resolved once at session start; if the meeting
+app's output is later routed to a different sink (e.g. switching apps
+mid-call, plugging in headphones), the recorded monitor goes silent while the
+mic keeps the stereo file growing — so remote participants are lost with no
+process failure and no warning.  Test suite grows 69 → 81 (12 new).
+
+### Added
+
+* **`audio.sample_channel_rms(path, *, tail_seconds=8.0)`** — cheaply measures
+  per-channel active RMS from the tail of a growing recording chunk (ffmpeg
+  `-sseof` end-relative seek).  Returns `(mic_rms, system_rms)` over active
+  samples, or `None` (treated as "unknown", never "silent") on any failure.
+* **Watchdog system-silence check.**  `RecordingSession._check_system_channel`
+  samples the current chunk every `_CHANNEL_CHECK_INTERVAL` (5 s) and flags
+  `system_silent` once the mic has been active but the system channel silent
+  for `_SYSTEM_SILENCE_TIMEOUT` (42 s).  Gated on the system channel having
+  been active at least once, so genuine in-room meetings (no system audio at
+  all) never warn.  The RMS ratio (`_SYSTEM_SILENT_RATIO = 0.10`) matches the
+  pipeline's `system_inactive_rms_ratio`, so a recording that warns here is
+  exactly one that trips single-source fallback downstream.
+* **`RecordingStatus.system_silent` / `system_ever_active`** — surfaced so the
+  `record` CLI prints a persistent, non-interrupting warning
+  (`⚠ System audio silent — remote participants may not be recorded`) and a
+  `✔ System audio restored` line on recovery (re-arms per episode).
+* **`session.json` records `system_ever_active` and `system_silent_detected`**
+  so a recording where remotes were likely not captured is auditable without
+  re-analyzing the audio.
+
 ## v0.5.0 — 2026-07-06 — orphan-recorder race fixes, leak-proof lifecycle, crash-safe WAV headers
 
 Reliability release.  Fixes the stop/pause-vs-watchdog races that could

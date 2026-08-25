@@ -75,12 +75,29 @@ def _recording_loop(session) -> None:
     """
     last_restart_count = 0
     warned_failed = False
+    warned_system_silent = False
 
     try:
         while True:
             status = session.status()
             elapsed = fmt_elapsed(status.elapsed_seconds)
             size = fmt_size(status.file_size_bytes)
+
+            # System-channel silence: warn once per silence episode, on its
+            # own line (does not interrupt recording), and re-arm on recovery
+            # so a second drop warns again.
+            if status.system_silent and not warned_system_silent:
+                click.echo(
+                    f"\r\033[K\033[1;33m⚠ System audio silent\033[0m  "
+                    f"{elapsed}  — remote participants may not be recorded. "
+                    f"Check your meeting app's output device."
+                )
+                warned_system_silent = True
+            elif not status.system_silent and warned_system_silent:
+                click.echo(
+                    f"\r\033[K\033[1;32m✔ System audio restored\033[0m  {elapsed}"
+                )
+                warned_system_silent = False
 
             if status.failed and not warned_failed:
                 reason = status.fail_reason or "unknown error"

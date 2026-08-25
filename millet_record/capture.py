@@ -44,6 +44,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import IO
 
+from .audio import sample_channel_rms
+
 # ─── Constants ───────────────────────────────────────────────────────────────
 
 _WATCHDOG_INTERVAL = 3.0  # seconds between health checks
@@ -53,6 +55,22 @@ _MAX_RESTART_ATTEMPTS = 5  # max consecutive restart attempts
 _STALL_TIMEOUT = 15.0  # seconds of no file growth before declaring stall
 DRAIN_SECONDS = 10  # seconds to keep recording after user requests stop,
 # allowing ffmpeg's ~0.9x realtime pipeline to flush
+
+# ── System-channel silence detection ──
+# The system-audio channel (remote participants) can go silent mid-recording
+# without any process/file-growth failure — e.g. the meeting app's output is
+# switched to a different sink, so the recorded monitor carries nothing while
+# the mic keeps the stereo file growing normally.  The watchdog samples the
+# tail of the current chunk and flags this so the UI can warn the scribe.
+_CHANNEL_CHECK_INTERVAL = 5.0  # seconds between per-channel activity samples
+_SYSTEM_SILENCE_TIMEOUT = 42.0  # seconds of mic-active-but-system-silent before flagging
+# System RMS at or below this fraction of the mic's active RMS counts as
+# silent.  Matches the pipeline's system_inactive_rms_ratio so a recording
+# that warns here is exactly one that trips single-source fallback downstream.
+_SYSTEM_SILENT_RATIO = 0.10
+# Active-RMS floor (int16 amplitude) below which a channel is treated as
+# carrying no speech.  Matches audio._SILENCE_THRESHOLD.
+_SILENCE_FLOOR = 50.0
 
 # WAV format constants (must match recorder output settings)
 _WAV_HEADER_BYTES = 44  # standard WAV header size
@@ -267,6 +285,8 @@ class RecordingStatus:
     failed: bool
     fail_reason: str | None = None
     paused: bool = False
+    system_silent: bool = False
+    system_ever_active: bool = False
 
 
 @dataclass
@@ -308,6 +328,13 @@ class RecordingSession:
     _last_file_size: int = field(default=0, repr=False)
     _last_growth_time: float = field(default=0.0, repr=False)
     _actual_monitor: str = field(default="", repr=False)
+
+    # System-channel silence tracking (see _check_system_channel)
+    _system_silent: bool = field(default=False, repr=False)
+    _system_ever_active: bool = field(default=False, repr=False)
+    _system_silent_detected: bool = field(default=False, repr=False)
+    _mic_active_since_sys: float = field(default=0.0, repr=False)
+    _last_channel_check: float = field(default=0.0, repr=False)
 
     def start(self) -> None:
         """Start recording with watchdog monitoring."""
@@ -483,6 +510,13 @@ class RecordingSession:
         if self.output_file.exists():
             self._metadata["file_size_bytes"] = self.output_file.stat().st_size
 
+        # Per-channel outcome: was the system (remote) channel ever active,
+        # and did it go silent mid-recording?  Lets downstream tooling flag a
+        # recording where remote participants were likely not captured without
+        # re-analyzing the audio.
+        self._metadata["system_ever_active"] = self._system_ever_active
+        self._metadata["system_silent_detected"] = self._system_silent_detected
+
         # F7 fix (M8, reported by @patternn 2026-05-17): propagate
         # ``stop_reason`` from the recorder log into session.json.
         # The recorder (Mac sidecar via meet-record-mac, Linux via ffmpeg)
@@ -583,6 +617,8 @@ class RecordingSession:
                 failed=self._failed,
                 fail_reason=self._fail_reason,
                 paused=self._paused,
+                system_silent=self._system_silent,
+                system_ever_active=self._system_ever_active,
             )
 
     # ── ffmpeg process management ────────────────────────────────────────
@@ -928,6 +964,7 @@ class RecordingSession:
                 break
 
             restart_reason: str | None = None
+            channel_check_chunk: Path | None = None
             with self._lock:
                 if self._failed:
                     break
@@ -963,8 +1000,65 @@ class RecordingSession:
                                     f"Output file stalled for {stall_duration:.0f}s"
                                 )
 
+                # Check 3: Is the system (remote) channel still carrying audio?
+                # Sampling decodes ffmpeg (slow), so do it outside the lock —
+                # here we only decide whether it's due and grab the chunk path.
+                if restart_reason is None and chunk and chunk.exists():
+                    now = time.monotonic()
+                    if now - self._last_channel_check >= _CHANNEL_CHECK_INTERVAL:
+                        self._last_channel_check = now
+                        channel_check_chunk = chunk
+
             if restart_reason is not None:
                 self._attempt_restart(restart_reason)
+            elif channel_check_chunk is not None:
+                self._check_system_channel(channel_check_chunk)
+
+    def _check_system_channel(self, chunk: Path) -> None:
+        """Detect a silent system (remote) channel while the mic is active.
+
+        Samples the tail of the current chunk and flags ``_system_silent``
+        when the mic has been active but the system channel has stayed silent
+        for ``_SYSTEM_SILENCE_TIMEOUT`` — the signature of the meeting app's
+        output being routed away from the recorded monitor (e.g. an app/sink
+        switch mid-call).  Never interrupts recording; only sets state the UI
+        reads.  Gated on the system channel having been active at least once,
+        so genuine in-room meetings (no system audio at all) never warn.
+        """
+        rms = sample_channel_rms(chunk)
+        if rms is None:
+            return  # unknown ≠ silent — stay conservative
+        mic_rms, sys_rms = rms
+
+        # Is the mic actually carrying speech right now?  If nobody is
+        # talking on either channel, silence is expected — don't count it.
+        mic_active = mic_rms > _SILENCE_FLOOR
+        sys_active = sys_rms > _SILENCE_FLOOR and sys_rms > _SYSTEM_SILENT_RATIO * mic_rms
+
+        now = time.monotonic()
+        with self._lock:
+            if sys_active:
+                self._system_ever_active = True
+                self._system_silent = False
+                self._mic_active_since_sys = 0.0
+                return
+
+            # System channel is silent.  Only meaningful once it has been
+            # active before (otherwise treat as an intentional in-room mic).
+            if not self._system_ever_active:
+                return
+
+            if not mic_active:
+                # Nobody talking — reset the silence timer, this is a lull.
+                self._mic_active_since_sys = 0.0
+                return
+
+            # Mic active, system silent: start/continue the timer.
+            if self._mic_active_since_sys == 0.0:
+                self._mic_active_since_sys = now
+            elif now - self._mic_active_since_sys >= _SYSTEM_SILENCE_TIMEOUT:
+                self._system_silent = True
+                self._system_silent_detected = True
 
     # ── Chunk stitching ──────────────────────────────────────────────────
 
