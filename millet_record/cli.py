@@ -27,6 +27,7 @@ import datetime
 import signal
 import sys
 import time
+from functools import partial
 from pathlib import Path
 
 import click
@@ -300,24 +301,63 @@ def _deprecated_meet_main() -> None:
     "--virtual-sink", is_flag=True, default=False,
     help="Use a virtual sink for isolated capture",
 )
-def record(output_dir, filename, mic, monitor, virtual_sink):
+@click.option(
+    "--capture-backend",
+    type=click.Choice(["default", "pocketstation"]),
+    default="default",
+    show_default=True,
+    help="Recorder to use",
+)
+@click.option(
+    "--application", type=str, default=None,
+    help="Desktop application name or process ID for PocketStation capture",
+)
+def record(output_dir, filename, mic, monitor, virtual_sink, capture_backend, application):
     """Record meeting audio. Press Ctrl+C to stop."""
-    from .capture import check_prerequisites, create_session
+    if capture_backend == "pocketstation":
+        from .pocketstation_capture import (
+            check_pocketstation_prerequisites,
+            create_pocketstation_session,
+        )
 
-    issues = check_prerequisites()
+        if application is None:
+            raise click.UsageError(
+                "--application is required with --capture-backend pocketstation"
+            )
+        try:
+            application_selector: str | int = int(application)
+        except ValueError:
+            application_selector = application
+        issues = check_pocketstation_prerequisites()
+        create_selected_session = partial(
+            create_pocketstation_session,
+            application=application_selector,
+            output_dir=output_dir,
+            filename=filename,
+            microphone=mic or True,
+        )
+    else:
+        from .capture import check_prerequisites, create_session
+
+        if application is not None:
+            raise click.UsageError(
+                "--application requires --capture-backend pocketstation"
+            )
+        issues = check_prerequisites()
+        create_selected_session = partial(
+            create_session,
+            output_dir=output_dir,
+            filename=filename,
+            mic=mic,
+            monitor=monitor,
+            virtual_sink=virtual_sink,
+        )
     if issues:
         click.echo("Prerequisites check failed:", err=True)
         for issue in issues:
             click.echo(f"  - {issue}", err=True)
         sys.exit(1)
-
-    session = create_session(
-        output_dir=output_dir,
-        filename=filename,
-        mic=mic,
-        monitor=monitor,
-        virtual_sink=virtual_sink,
-    )
+    session = create_selected_session()
 
     click.echo(f"Recording to: {session.output_file}")
     click.echo(f"  Mic source:     {session.mic_source}")
@@ -348,7 +388,8 @@ def record(output_dir, filename, mic, monitor, virtual_sink):
     try:
         _recording_loop(session)
     except KeyboardInterrupt:
-        _drain_countdown(session)
+        if getattr(session, "needs_drain", True):
+            _drain_countdown(session)
         click.echo("Stopping recording...")
         output = session.stop()
         stopped = True

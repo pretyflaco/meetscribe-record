@@ -48,6 +48,29 @@ millet request-permissions     # macOS Sequoia 15+: trigger Microphone /
 `millet record` writes to `~/millet-recordings/meeting-YYYYMMDD-HHMMSS/...wav`
 unless `-o` is passed. See `millet record --help` for options.
 
+### Capture a desktop application with PocketStation
+
+Install the optional recorder when you want one application instead of the
+complete system mix:
+
+```bash
+pip install 'millet-record[pocketstation]'
+millet record --capture-backend pocketstation --application Zoom
+```
+
+PocketStation captures the selected application and the default microphone as
+separate native streams on macOS, Windows, and Linux. Millet keeps its existing
+WAV layout: microphone on the left channel and application audio on the right.
+You can pass an application process ID when more than one running application
+has the same name.
+
+On first use, allow Microphone and Screen & System Audio Recording when macOS
+asks. If capture is denied, open System Settings → Privacy & Security and grant
+both permissions to the terminal or application that runs Millet.
+
+The existing recorder remains the default. PocketStation is loaded only when
+you select it with `--capture-backend pocketstation`.
+
 When `millet-pipeline` is also installed, additional subcommands
 (`transcribe`, `run`, `label`, `sync`, `gui`, ...) become available
 under the same `millet` command via Click entry-points.
