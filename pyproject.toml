@@ -85,6 +85,7 @@ millet_record = ["_bin/*", "_bin/.*"]
 
 [project.optional-dependencies]
 dev = ["ruff", "pytest", "pytest-timeout", "build"]
+pocketstation = ["pocketstation>=0.1.3,<0.2"]
 
 [tool.ruff]
 target-version = "py310"
